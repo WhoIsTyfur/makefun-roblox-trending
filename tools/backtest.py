@@ -85,11 +85,14 @@ def run(reads, forecaster, min_answers=1, verbose=False, only_practice=False):
         f = parse_doc(doc)
         read_scores = []
         place_rows = []
+        prob_rows = []
         horizons = []
         for a in answers:
             pp = per_place_scores(f, a.chart)
             read_scores.append(sum(pp))
             place_rows.append(pp)
+            prob_rows.append([(score.place_probability(f, k, a.chart[k - 1], a.chart), a.chart[k - 1] in f.named[k - 1])
+                              for k in range(1, min(PLACES, len(a.chart)) + 1)])
             horizons.append((a.at - last.at).total_seconds() / 3600.0)
         windows.append({
             "last": last.at,
@@ -97,6 +100,8 @@ def run(reads, forecaster, min_answers=1, verbose=False, only_practice=False):
             "score": sum(read_scores) / len(read_scores),
             "reads": read_scores,
             "places": place_rows,
+            "probs": prob_rows,
+            "named_total": list(f.sums),
             "horizons": horizons,
             "hits": sum(score.hits_of(f.top, a.chart) for a in answers) / len(answers),
         })
@@ -111,6 +116,19 @@ def summarise(name, windows):
         return
     mean = sum(w["score"] for w in windows) / len(windows)
     print(f"{name}: {len(windows)} windows, mean {mean:.3f}, hits {sum(w['hits'] for w in windows) / len(windows):.2f}")
+    unnamed = [0] * PLACES
+    named_total = [0.0] * PLACES
+    n_rows = 0
+    for w in windows:
+        for row in w["probs"]:
+            n_rows += 1
+            for k, (p, named) in enumerate(row):
+                if not named:
+                    unnamed[k] += 1
+        for k, tot in enumerate(w["named_total"]):
+            named_total[k] += tot
+    print("  actual unnamed (per read, by place): " + " ".join(f"{u / n_rows:6.2f}" for u in unnamed))
+    print("  named total by place:                " + " ".join(f"{t / len(windows):6.2f}" for t in named_total))
     buckets = [(0, 6), (6, 12), (12, 18), (18, 24.01)]
     parts = []
     for lo, hi in buckets:
@@ -136,7 +154,13 @@ def main():
     ap.add_argument("--min-answers", type=int, default=1)
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--no-baseline", action="store_true")
+    ap.add_argument("--set", nargs="*", default=[], help="override main.py constants, NAME=VALUE")
     args = ap.parse_args()
+    for item in args.set:
+        name, value = item.split("=", 1)
+        setattr(model, name, type(getattr(model, name))(value) if not isinstance(getattr(model, name), (list, tuple))
+                else json.loads(value))
+        print(f"set {name} = {getattr(model, name)}")
     reads = load_all(args.reads)
     print(f"{len(reads)} reads from {reads[0].at:%Y-%m-%d %H:%M} to {reads[-1].at:%Y-%m-%d %H:%M}")
     model_windows = run(reads, model.forecast, args.min_answers, args.list)

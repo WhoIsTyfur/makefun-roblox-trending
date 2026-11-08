@@ -37,6 +37,8 @@ TILT_TREND = 0.5
 TREND_SPAN = 5.0
 NAME_MIN_P = 0.0025
 MAX_NAMED = 0.999
+RECENCY_HALFLIFE_D = 0.0  # > 0: halve a pair's weight for every this many days its later read precedes the last read
+SHARPEN = 1.0             # exponent on the named probabilities of a place before the tilt (1 = none)
 NEW = "new"
 
 
@@ -90,13 +92,16 @@ def load_history(path):
 
 
 def observations(reads, places):
-    """(lag hours, offsets) for every pair i < j with lag <= MAX_LAG_H.
+    """(lag hours, offsets, recency weight) for every pair i < j with lag <= MAX_LAG_H.
 
     offsets[k-1] is rank_i(game at place k of read j) - k, or NEW when read i did not list it.
     """
     obs = []
+    last_at = reads[-1].at
     for j in range(1, len(reads)):
         rj = reads[j]
+        age_days = (last_at - rj.at).total_seconds() / 86400.0
+        recency = 0.5 ** (age_days / RECENCY_HALFLIFE_D) if RECENCY_HALFLIFE_D > 0 else 1.0
         for i in range(j - 1, -1, -1):
             ri = reads[i]
             lag = (rj.at - ri.at).total_seconds() / 3600.0
@@ -107,14 +112,14 @@ def observations(reads, places):
                 uid = rj.chart[k - 1]
                 r = ri.rank.get(uid)
                 offs.append(NEW if r is None else r - k)
-            obs.append((lag, offs))
+            obs.append((lag, offs, recency))
     return obs
 
 
 def kernel_weights(obs, horizon):
     width = KERNEL_WIDTH_H
     while True:
-        w = [max(0.0, 1.0 - abs(lag - horizon) / width) for lag, _ in obs]
+        w = [rec * max(0.0, 1.0 - abs(lag - horizon) / width) for lag, _, rec in obs]
         if sum(w) >= KERNEL_MIN_MASS or width >= KERNEL_MAX_WIDTH_H:
             return w
         width *= 1.5
@@ -160,7 +165,7 @@ def mix(components):
 def place_distributions(obs, weights, places, length):
     """Per place k: the mixed distribution over ranks of the last chart (and NEW) at one horizon."""
     own = [dict() for _ in range(places)]
-    for (lag, offs), w in zip(obs, weights):
+    for (lag, offs, _rec), w in zip(obs, weights):
         if w <= 0:
             continue
         for idx, off in enumerate(offs):
@@ -228,7 +233,7 @@ def tilt(dist, k, last, feats, strength):
         uid = last.chart[key - 1]
         old, trend = feats[uid]
         factor = math.exp(strength * (TILT_OLD * (1.0 if old else 0.0) + TILT_TREND * trend * (key - k) / TREND_SPAN))
-        out[uid] = v * factor
+        out[uid] = (v ** SHARPEN) * factor
     s = sum(out.values())
     return {uid: v * named_total / s for uid, v in out.items()}
 
