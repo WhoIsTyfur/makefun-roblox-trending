@@ -6,3 +6,4 @@ start-clean.ps1
 wallet.json
 out/
 __pycache__/
+data/live/
