@@ -32,13 +32,28 @@ W_PRIOR = 4.0
 PRIOR_SCALE = 2.5
 PRIOR_NEW = 0.04
 OLD_DAYS = 6.0
-TILT_OLD = -0.5
+TILT_OLD = 0.0            # the flat old-age tilt is replaced by the age hazard below (backtest: +0.05)
 TILT_TREND = 0.5
 TREND_SPAN = 5.0
 NAME_MIN_P = 0.0025
 MAX_NAMED = 0.999
 RECENCY_HALFLIFE_D = 0.0  # > 0: halve a pair's weight for every this many days its later read precedes the last read
 SHARPEN = 1.0             # exponent on the named probabilities of a place before the tilt (1 = none)
+# Occupancy: with hourly reads, the share of the last day each game held a place (the chart has a daily cycle, and
+# one forecast is scored against every hour of a day). Blended into the transition model in proportion to how much
+# of the last day the hourly reads cover, and more at longer horizons.
+OCC_GAP_H = 1.5           # a read with another read within this many hours counts as hourly
+OCC_W2 = 0.4              # weight of hourly reads 24 to 48 h before the last read, against 1 for the last 24 h
+OCC_MAX = 0.3             # blend weight at full coverage and horizon
+OCC_RAMP_H = 12.0         # the blend reaches full strength at this horizon
+OCC_PLACES = 2            # blend only places 1..OCC_PLACES: lower places drift down over a day, so their past share
+#                           predicts less (a proxy test on the archive's reads gained at places 1-2, lost from 3 on)
+# Age hazard: a game's chance of leaving the chart within the horizon, rising with its time on the chart. Its mass at
+# a place passes to the games below it there (they move up when it leaves), or to the unnamed share.
+HAZ_START_D = 7.0         # no hazard before this many days on the chart (known-age games under 7 days never left)
+HAZ_RATE = 0.1            # leaving rate per day, per day on the chart past HAZ_START_D (0 = off)
+HAZ_MAX_RATE = 0.15       # cap on the leaving rate per day: the rate seen for games already on the chart when the
+#                           archive starts (65 of 476 game-days); ages beyond the history's span are not observed
 NEW = "new"
 
 
@@ -210,15 +225,78 @@ def game_features(reads):
             earlier = r
     feats = {}
     for uid in last.chart:
-        old = (last.at - first_seen[uid]).total_seconds() >= OLD_DAYS * 86400.0
+        age_days = (last.at - first_seen[uid]).total_seconds() / 86400.0
+        old = age_days >= OLD_DAYS
         trend = 0.0
         if earlier is not None:
             now_p = last.playing.get(uid)
             then_p = earlier.playing.get(uid)
             if now_p and then_p and now_p > 0 and then_p > 0:
                 trend = max(-1.0, min(1.0, math.log(now_p / then_p)))
-        feats[uid] = (old, trend)
+        feats[uid] = (old, trend, age_days)
     return feats
+
+
+def occupancy(reads, places):
+    """Per place, the share of the last two days' hourly reads each game of the last chart held it (NEW for games no
+    longer on the chart), and the coverage of the last day by those reads in [0, 1]. Reads with no other read
+    within OCC_GAP_H do not count, so a history of sparse reads gives coverage 0."""
+    last = reads[-1]
+    shares = [dict() for _ in range(places)]
+    total = 0.0
+    coverage = 0.0
+    for idx, r in enumerate(reads):
+        age_h = (last.at - r.at).total_seconds() / 3600.0
+        if age_h > 48.0:
+            continue
+        gap_prev = (r.at - reads[idx - 1].at).total_seconds() / 3600.0 if idx > 0 else float("inf")
+        gap_next = (reads[idx + 1].at - r.at).total_seconds() / 3600.0 if idx + 1 < len(reads) else float("inf")
+        if min(gap_prev, gap_next) > OCC_GAP_H:
+            continue
+        span = min(1.0, gap_prev)
+        w = span * (1.0 if age_h <= 24.0 else OCC_W2)
+        if age_h <= 24.0:
+            coverage += span
+        total += w
+        for k in range(1, min(places, len(r.chart)) + 1):
+            uid = r.chart[k - 1]
+            key = uid if uid in last.rank else NEW
+            shares[k - 1][key] = shares[k - 1].get(key, 0.0) + w
+    if total <= 0:
+        return None, 0.0
+    return [{key: v / total for key, v in d.items()} for d in shares], min(1.0, coverage / 24.0)
+
+
+def blend_occupancy(dist, occ, last, alpha):
+    """Mix a place's transition distribution (keys: ranks of the last chart and NEW) with its occupancy (keys: ids
+    and NEW), both expressed over ranks, with weight alpha on the occupancy."""
+    out = {key: (1.0 - alpha) * v for key, v in dist.items()}
+    for key, v in occ.items():
+        rk = NEW if key == NEW else last.rank[key]
+        out[rk] = out.get(rk, 0.0) + alpha * v
+    return out
+
+
+def hazard(named, k, last, feats, horizon):
+    """Move each game's leaving probability within the horizon to the games below it at the place (or unnamed)."""
+    if HAZ_RATE <= 0:
+        return named
+    out = dict(named)
+    order = sorted(out, key=lambda uid: last.rank[uid])
+    for uid in order:
+        age = feats[uid][2]
+        if age <= HAZ_START_D or out.get(uid, 0.0) <= 0:
+            continue
+        rate = min(HAZ_MAX_RATE, HAZ_RATE * (age - HAZ_START_D))
+        leave = 1.0 - math.exp(-rate * horizon / 24.0)
+        moved = out[uid] * leave
+        out[uid] -= moved
+        below = {g: p for g, p in out.items() if last.rank[g] > last.rank[uid] and p > 0}
+        s = sum(below.values())
+        if s > 0:
+            for g, p in below.items():
+                out[g] += moved * p / s
+    return out
 
 
 def tilt(dist, k, last, feats, strength):
@@ -231,7 +309,7 @@ def tilt(dist, k, last, feats, strength):
         if key == NEW:
             continue
         uid = last.chart[key - 1]
-        old, trend = feats[uid]
+        old, trend, _age = feats[uid]
         factor = math.exp(strength * (TILT_OLD * (1.0 if old else 0.0) + TILT_TREND * trend * (key - k) / TREND_SPAN))
         out[uid] = (v ** SHARPEN) * factor
     s = sum(out.values())
@@ -244,6 +322,7 @@ def forecast(reads, window_from, slot_minutes, slots, places):
     length = len(last.chart)
     obs = observations(reads, places)
     feats = game_features(reads)
+    occ, coverage = occupancy(reads, places)
     acc = [dict() for _ in range(places)]
     for s in range(slots):
         slot_time = window_from + timedelta(minutes=slot_minutes * s)
@@ -251,8 +330,10 @@ def forecast(reads, window_from, slot_minutes, slots, places):
         weights = kernel_weights(obs, horizon)
         dists = place_distributions(obs, weights, places, length)
         strength = min(1.0, horizon / 24.0)
+        alpha = OCC_MAX * coverage * min(1.0, horizon / OCC_RAMP_H) if occ else 0.0
         for k in range(1, places + 1):
-            tilted = tilt(dists[k - 1], k, last, feats, strength)
+            dist = blend_occupancy(dists[k - 1], occ[k - 1], last, alpha) if alpha > 0 and k <= OCC_PLACES else dists[k - 1]
+            tilted = hazard(tilt(dist, k, last, feats, strength), k, last, feats, horizon)
             for uid, v in tilted.items():
                 acc[k - 1][uid] = acc[k - 1].get(uid, 0.0) + v / slots
     probabilities = []

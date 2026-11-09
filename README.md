@@ -17,10 +17,19 @@ over the window's 24 slots.
    triangular kernel on the difference between their lag and the horizon, widened until enough weight is
    present. Per place, four offset distributions are mixed with pseudo-observation weights: the place's own,
    its band of neighbouring places, all places pooled, and a smooth prior centred on the place.
-4. Offsets are mapped to games through the last read's chart. Each game's probability is tilted by its age
-   on the chart (games tend to leave after about a week) and by its player-count trend over the previous
-   day, then rescaled so the place's named total is unchanged.
-5. Slots are averaged. Games below a small threshold are left unnamed, so their mass goes to the scorer's
+4. Offsets are mapped to games through the last read's chart. When the history holds hourly reads, places 1
+   and 2 also blend in an occupancy share: how much of the last day (and, at a lower weight, the day before)
+   each game held the place. The chart follows a daily cycle in concurrent players, and one forecast is
+   scored against every hour of a day, so a game's share of the day is close to the right probability. The
+   blend grows with the hourly coverage of the last day and with the horizon; with no hourly reads the
+   forecast is unchanged. Lower places drift down over a day, so their past share predicts less and they are
+   left to the transition model.
+5. Each game's probability is tilted by its player-count trend over the previous day, keeping the place's
+   named total unchanged. Then an age hazard applies: the chart ranks the past week's relative growth in
+   daily users, so a game's chance of leaving rises once it has been on the chart about a week. The hazard is
+   mild and capped at the leaving rate the data shows, and the mass it removes from a game passes to the
+   games below it at that place, which move up when it leaves.
+6. Slots are averaged. Games below a small threshold are left unnamed, so their mass goes to the scorer's
    evenly shared remainder, which also covers games that enter the chart from outside it.
 
 ## How it is scored
@@ -46,7 +55,8 @@ produce the same bytes. On the bounty's practice input the run takes well under 
   of a window.
 - `tools/backtest.py`: rolls a window over every read of the archive with enough history before it, scores
   the model and the house baseline on the reads that follow, and reports means by horizon and by place.
-  `--set NAME=VALUE` overrides the model's constants for parameter sweeps.
+  `--set NAME=VALUE` overrides the model's constants for parameter sweeps; `--hourly` is the hourly test, which
+  cuts the history only at hourly reads and scores only against the hourly reads that follow.
 - `tools/convert_live.py`: converts raw hourly reads of the chart's API response into the read shape used by
   the history, for extending the backtest with hourly data.
 

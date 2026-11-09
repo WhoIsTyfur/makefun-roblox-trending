@@ -68,14 +68,28 @@ def load_all(paths):
     return kept
 
 
-def run(reads, forecaster, min_answers=1, verbose=False, only_practice=False):
+def hourly_flags(reads, gap_h=1.5):
+    """True for reads with another read within gap_h hours: the hourly ones."""
+    flags = []
+    for i, r in enumerate(reads):
+        prev_gap = (r.at - reads[i - 1].at).total_seconds() / 3600.0 if i > 0 else float("inf")
+        next_gap = (reads[i + 1].at - r.at).total_seconds() / 3600.0 if i + 1 < len(reads) else float("inf")
+        flags.append(min(prev_gap, next_gap) <= gap_h)
+    return flags
+
+
+def run(reads, forecaster, min_answers=1, verbose=False, only_practice=False, hourly=False):
+    """hourly: cut the history only at hourly reads and score only against the hourly reads that follow."""
     windows = []
+    flags = hourly_flags(reads)
     for idx in range(MIN_HISTORY, len(reads)):
         last = reads[idx]
+        if hourly and not flags[idx]:
+            continue
         history = reads[: idx + 1]
         start = next_whole_hour(last.at)
         until = start + timedelta(hours=24)
-        answers = [r for r in reads[idx + 1:] if start <= r.at < until]
+        answers = [r for r, fl in zip(reads[idx + 1:], flags[idx + 1:]) if start <= r.at < until and (fl or not hourly)]
         if len(answers) < min_answers:
             continue
         is_practice = last.at.strftime("%Y-%m-%dT%H:%M:%SZ") == PRACTICE_END
@@ -155,6 +169,7 @@ def main():
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--no-baseline", action="store_true")
     ap.add_argument("--set", nargs="*", default=[], help="override main.py constants, NAME=VALUE")
+    ap.add_argument("--hourly", action="store_true", help="the hourly test: cut at hourly reads, score on hourly reads")
     args = ap.parse_args()
     for item in args.set:
         name, value = item.split("=", 1)
@@ -163,10 +178,12 @@ def main():
         print(f"set {name} = {getattr(model, name)}")
     reads = load_all(args.reads)
     print(f"{len(reads)} reads from {reads[0].at:%Y-%m-%d %H:%M} to {reads[-1].at:%Y-%m-%d %H:%M}")
-    model_windows = run(reads, model.forecast, args.min_answers, args.list)
+    if args.hourly:
+        print(f"hourly test: {sum(hourly_flags(reads))} hourly reads")
+    model_windows = run(reads, model.forecast, args.min_answers, args.list, hourly=args.hourly)
     summarise("model", model_windows)
     if not args.no_baseline:
-        base_windows = run(reads, lambda h, *_: baseline_doc(h), args.min_answers)
+        base_windows = run(reads, lambda h, *_: baseline_doc(h), args.min_answers, hourly=args.hourly)
         summarise("baseline", base_windows)
         wins = sum(1 for m, b in zip(model_windows, base_windows) if m["score"] > b["score"])
         print(f"model beats baseline in {wins} of {len(model_windows)} windows")
