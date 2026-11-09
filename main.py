@@ -239,7 +239,7 @@ def game_features(reads):
             earlier = r
     # The riser score's reference read: the one closest to RISER_LOOKBACK_H before the last read, if close enough.
     ref_target = last.at - timedelta(hours=RISER_LOOKBACK_H)
-    ref_tolerance = RISER_TOLERANCE * RISER_LOOKBACK_H
+    ref_tolerance = RISER_TOLERANCE * RISER_LOOKBACK_H + 1e-9   # inclusive: 0.6 * 12.0 is 7.199999999999999 in floats
     ref = None
     for r in reads[:-1]:
         gap = abs((r.at - ref_target).total_seconds()) / 3600.0
