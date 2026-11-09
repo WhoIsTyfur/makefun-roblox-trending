@@ -24,13 +24,19 @@ over the window's 24 slots.
    blend grows with the hourly coverage of the last day and with the horizon; with no hourly reads the
    forecast is unchanged. Lower places drift down over a day, so their past share predicts less and they are
    left to the transition model.
-5. Each game's probability is tilted by its player-count trend over the previous day, keeping the place's
+5. Deep-origin share. Now and then a game takes a place from five or more places below it. The offset model
+   would put that mass on whichever game happens to sit at the exact rank a past riser came from, so the
+   place's deep mass is pooled and shared over every game that far down instead: nearer ranks first, and
+   rising games first (in rank over the last half day, or in players over the last day).
+6. Each game's probability is tilted by its player-count trend over the previous day, keeping the place's
    named total unchanged. Then an age hazard applies: the chart ranks the past week's relative growth in
    daily users, so a game's chance of leaving rises once it has been on the chart about a week. The hazard is
    mild and capped at the leaving rate the data shows, and the mass it removes from a game passes to the
    games below it at that place, which move up when it leaves.
-6. Slots are averaged. Games below a small threshold are left unnamed, so their mass goes to the scorer's
-   evenly shared remainder, which also covers games that enter the chart from outside it.
+7. Slots are averaged and the games above a small threshold are named at the place. Newcomer tail: every
+   other game of the last chart is named too, each with an equal share of half of what the place has left.
+   The scorer shares a place's unnamed remainder among the chart's games the forecast does not name there,
+   so the half kept unnamed goes only to games new to the chart, not thinly over the whole chart.
 
 ## How it is scored
 

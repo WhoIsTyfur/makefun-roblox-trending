@@ -54,6 +54,20 @@ HAZ_START_D = 7.0         # no hazard before this many days on the chart (known-
 HAZ_RATE = 0.1            # leaving rate per day, per day on the chart past HAZ_START_D (0 = off)
 HAZ_MAX_RATE = 0.15       # cap on the leaving rate per day: the rate seen for games already on the chart when the
 #                           archive starts (65 of 476 game-days); ages beyond the history's span are not observed
+# Deep origins: a game that takes a place from DEEP_OFFSET or more places below it. The offset model puts that mass
+# on whichever game sits at the exact rank a past riser came from; instead the place's deep mass is shared over every
+# game that far down, nearer ranks first and rising games (in rank over the last half day, or in players over the
+# last day) first.
+DEEP_OFFSET = 5           # ranks r with r - k >= this are deep origins for place k
+DEEP_DECAY = 10.0         # a rank's share falls by a factor e for every this many ranks further down
+RISER_STRENGTH = 3.0      # a full riser score multiplies a game's share by e^3
+RISER_LOOKBACK_H = 12.0   # the rank rise is measured against the read closest to this long before the last read
+RISER_TOLERANCE = 0.6     # ... accepted only within this fraction of the lookback of that time (else no riser scores)
+# Newcomer tail: of what a place leaves after its named games, this part stays unnamed, so the scorer shares it only
+# among games new to the chart; the rest is spread equally over the last chart's other games, each named.
+NEWCOMER_SHARE = 0.5
+MAX_ROWS = 100            # the forecast format's cap on rows per place
+MIN_TAIL_P = 0.000001     # no tail when a game's equal share would be under this
 NEW = "new"
 
 
@@ -223,6 +237,14 @@ def game_features(reads):
         gap = abs((r.at - target).total_seconds()) / 3600.0
         if gap <= 12.0 and (earlier is None or gap < abs((earlier.at - target).total_seconds()) / 3600.0):
             earlier = r
+    # The riser score's reference read: the one closest to RISER_LOOKBACK_H before the last read, if close enough.
+    ref_target = last.at - timedelta(hours=RISER_LOOKBACK_H)
+    ref_tolerance = RISER_TOLERANCE * RISER_LOOKBACK_H
+    ref = None
+    for r in reads[:-1]:
+        gap = abs((r.at - ref_target).total_seconds()) / 3600.0
+        if gap <= ref_tolerance and (ref is None or gap < abs((ref.at - ref_target).total_seconds()) / 3600.0):
+            ref = r
     feats = {}
     for uid in last.chart:
         age_days = (last.at - first_seen[uid]).total_seconds() / 86400.0
@@ -233,7 +255,13 @@ def game_features(reads):
             then_p = earlier.playing.get(uid)
             if now_p and then_p and now_p > 0 and then_p > 0:
                 trend = max(-1.0, min(1.0, math.log(now_p / then_p)))
-        feats[uid] = (old, trend, age_days)
+        # Riser score in [0, 1]: the larger of the log rank rise since the reference read (a game not on that chart
+        # counts as one rank below its end) and the play trend, each clamped to [0, 1]; 0 with no reference read.
+        riser = 0.0
+        if ref is not None:
+            rose = math.log(ref.rank.get(uid, len(ref.chart) + 1) / last.rank[uid])
+            riser = max(max(0.0, min(1.0, rose)), max(0.0, min(1.0, trend)))
+        feats[uid] = (old, trend, age_days, riser)
     return feats
 
 
@@ -309,11 +337,29 @@ def tilt(dist, k, last, feats, strength):
         if key == NEW:
             continue
         uid = last.chart[key - 1]
-        old, trend, _age = feats[uid]
+        old, trend = feats[uid][0], feats[uid][1]
         factor = math.exp(strength * (TILT_OLD * (1.0 if old else 0.0) + TILT_TREND * trend * (key - k) / TREND_SPAN))
         out[uid] = (v ** SHARPEN) * factor
     s = sum(out.values())
     return {uid: v * named_total / s for uid, v in out.items()}
+
+
+def deep_share(dist, k, last, feats, length):
+    """Re-share the mass place k holds on deep origins (ranks DEEP_OFFSET or more below it) over every rank that deep,
+    in proportion to exp(-(r - k - DEEP_OFFSET) / DEEP_DECAY) * exp(RISER_STRENGTH * riser score of the game at r).
+    Keys are ranks of the last chart and NEW; NEW and the nearer ranks are untouched. No deep mass, no change."""
+    first = k + DEEP_OFFSET
+    deep = sum(v for key, v in dist.items() if key != NEW and key >= first)
+    if deep <= 0 or first > length:
+        return dist
+    out = {key: v for key, v in dist.items() if key == NEW or key < first}
+    weights = {}
+    for r in range(first, length + 1):
+        weights[r] = math.exp(-(r - first) / DEEP_DECAY) * math.exp(RISER_STRENGTH * feats[last.chart[r - 1]][3])
+    total = sum(weights.values())
+    for r, w in weights.items():
+        out[r] = deep * w / total
+    return out
 
 
 def forecast(reads, window_from, slot_minutes, slots, places):
@@ -333,6 +379,7 @@ def forecast(reads, window_from, slot_minutes, slots, places):
         alpha = OCC_MAX * coverage * min(1.0, horizon / OCC_RAMP_H) if occ else 0.0
         for k in range(1, places + 1):
             dist = blend_occupancy(dists[k - 1], occ[k - 1], last, alpha) if alpha > 0 and k <= OCC_PLACES else dists[k - 1]
+            dist = deep_share(dist, k, last, feats, length)
             tilted = hazard(tilt(dist, k, last, feats, strength), k, last, feats, horizon)
             for uid, v in tilted.items():
                 acc[k - 1][uid] = acc[k - 1].get(uid, 0.0) + v / slots
@@ -344,9 +391,24 @@ def forecast(reads, window_from, slot_minutes, slots, places):
         total = sum(d.values())
         if total > MAX_NAMED:
             d = {uid: p * MAX_NAMED / total for uid, p in d.items()}
-        rows = sorted(d.items(), key=lambda it: (-it[1], it[0]))
+        rows = sorted(d.items(), key=lambda it: (-it[1], it[0]))[:MAX_ROWS]
+        named_total = 0.0
         for uid, p in rows:
-            probabilities.append({"universe_id": uid, "place": k, "p": round(p, 6)})
+            p = round(p, 6)
+            probabilities.append({"universe_id": uid, "place": k, "p": p})
+            named_total += p
+        # The newcomer tail: name every other game of the last chart too, in rank order, each with an equal share of
+        # (1 - NEWCOMER_SHARE) of what the place has left. What stays unnamed is then shared, by the scorer, only
+        # among the games of the read's chart that were not on the last chart: the newcomers.
+        others = [uid for uid in last.chart if uid not in d][:max(0, MAX_ROWS - len(rows))]
+        if others:
+            share = (1.0 - NEWCOMER_SHARE) * (1.0 - named_total) / len(others)
+            if share >= MIN_TAIL_P:
+                tail_p = round(share, 6)
+                if named_total + tail_p * len(others) > 1.0:
+                    tail_p = math.floor(share * 1e6) / 1e6
+                for uid in others:
+                    probabilities.append({"universe_id": uid, "place": k, "p": tail_p})
         for uid, _ in sorted(acc[k - 1].items(), key=lambda it: (-it[1], it[0])):
             if uid not in picked:
                 picked.add(uid)
